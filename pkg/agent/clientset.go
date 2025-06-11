@@ -36,6 +36,29 @@ const (
 	fromFallback  = "fallback to 1"
 )
 
+// ClientSetConfig contains the configuration options for ClientSet.
+type ClientSetConfig struct {
+	Address                 string
+	AgentID                 string
+	AgentIdentifiers        string
+	SyncInterval            time.Duration
+	ProbeInterval           time.Duration
+	SyncIntervalCap         time.Duration
+	DialOptions             []grpc.DialOption
+	ServiceAccountTokenPath string
+	WarnOnChannelLimit      bool
+	SyncForever             bool
+	XfrChannelSize          int
+	ServerLeaseCounter      ServerCounter
+	ServerCountSource       string
+
+	// DenyList is a list of URI paths that should be denied by the agent
+	DenyList []string
+
+	// LogAPIRequests enables logging of API requests
+	LogAPIRequests bool
+}
+
 // ClientSet consists of clients connected to each instance of an HA proxy server.
 type ClientSet struct {
 	// mu guards access to the clients map
@@ -100,6 +123,10 @@ type ClientSet struct {
 	// and the agent figures out from these observations how many
 	// agent-to-proxy-server connections it should maintain.
 	serverCountSource string
+
+	// API request filtering configuration
+	denyList       []string
+	logAPIRequests bool
 }
 
 func (cs *ClientSet) ClientsCount() int {
@@ -163,22 +190,6 @@ func (cs *ClientSet) RemoveClient(serverID string) {
 	metrics.Metrics.SetServerConnectionsCount(len(cs.clients))
 }
 
-type ClientSetConfig struct {
-	Address                 string
-	AgentID                 string
-	AgentIdentifiers        string
-	SyncInterval            time.Duration
-	ProbeInterval           time.Duration
-	SyncIntervalCap         time.Duration
-	DialOptions             []grpc.DialOption
-	ServiceAccountTokenPath string
-	WarnOnChannelLimit      bool
-	SyncForever             bool
-	XfrChannelSize          int
-	ServerLeaseCounter      ServerCounter
-	ServerCountSource       string
-}
-
 func (cc *ClientSetConfig) NewAgentClientSet(drainCh, stopCh <-chan struct{}) *ClientSet {
 	return &ClientSet{
 		clients:                 make(map[string]*Client),
@@ -197,6 +208,8 @@ func (cc *ClientSetConfig) NewAgentClientSet(drainCh, stopCh <-chan struct{}) *C
 		stopCh:                  stopCh,
 		leaseCounter:            cc.ServerLeaseCounter,
 		serverCountSource:       cc.ServerCountSource,
+		denyList:                cc.DenyList,
+		logAPIRequests:          cc.LogAPIRequests,
 	}
 }
 

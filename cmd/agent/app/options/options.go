@@ -95,6 +95,12 @@ type GrpcProxyAgentOptions struct {
 	KubeconfigPath string
 	// Content type of requests sent to apiserver.
 	APIContentType string
+
+	// API request filtering configuration
+	// List of URI paths that should be denied by the agent
+	DenyList []string
+	// Whether to log API requests for debugging and auditing
+	LogAPIRequests bool
 }
 
 func (o *GrpcProxyAgentOptions) ClientSetConfig(dialOptions ...grpc.DialOption) *agent.ClientSetConfig {
@@ -111,6 +117,8 @@ func (o *GrpcProxyAgentOptions) ClientSetConfig(dialOptions ...grpc.DialOption) 
 		SyncForever:             o.SyncForever,
 		XfrChannelSize:          o.XfrChannelSize,
 		ServerCountSource:       o.ServerCountSource,
+		DenyList:                o.DenyList,
+		LogAPIRequests:          o.LogAPIRequests,
 	}
 }
 
@@ -144,6 +152,8 @@ func (o *GrpcProxyAgentOptions) Flags() *pflag.FlagSet {
 	flags.StringVar(&o.ServerCountSource, "server-count-source", o.ServerCountSource, "Defines how the server counts from lease and from server responses are combined. Possible values: 'default' to use only one source (server or leases depending on other flags), 'max' to take the larger value.")
 	flags.StringVar(&o.KubeconfigPath, "kubeconfig", o.KubeconfigPath, "Path to the kubeconfig file")
 	flags.StringVar(&o.APIContentType, "kube-api-content-type", o.APIContentType, "Content type of requests sent to apiserver.")
+	flags.StringSliceVar(&o.DenyList, "deny-path", o.DenyList, "URI paths that should be denied by the agent (can be specified multiple times)")
+	flags.BoolVar(&o.LogAPIRequests, "log-api-requests", false, "Enable logging of API requests")
 	return flags
 }
 
@@ -175,6 +185,8 @@ func (o *GrpcProxyAgentOptions) Print() {
 	klog.V(1).Infof("ServerCountSource set to %s.\n", o.ServerCountSource)
 	klog.V(1).Infof("ChannelSize set to %d.\n", o.XfrChannelSize)
 	klog.V(1).Infof("APIContentType set to %v.\n", o.APIContentType)
+	klog.V(1).Infof("DenyList set to %v.\n", o.DenyList)
+	klog.V(1).Infof("LogAPIRequests set to %v.\n", o.LogAPIRequests)
 }
 
 func (o *GrpcProxyAgentOptions) Validate() error {
@@ -294,6 +306,7 @@ func NewGrpcProxyAgentOptions() *GrpcProxyAgentOptions {
 		ServerCountSource:         "default",
 		KubeconfigPath:            "",
 		APIContentType:            runtime.ContentTypeProtobuf,
+		DenyList:                  []string{},
 	}
 	return &o
 }

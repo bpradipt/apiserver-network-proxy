@@ -24,6 +24,7 @@ import (
 	"os"
 	runpprof "runtime/pprof"
 	"strconv"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -151,6 +152,58 @@ type Client struct {
 	serviceAccountTokenPath string
 
 	warnOnChannelLimit bool
+
+	// API request filtering configuration
+	denyList       []string // List of URI patterns to deny
+	logAPIRequests bool     // Whether to log API requests
+}
+
+// parseHTTPRequest attempts to parse data as an HTTP request
+func parseHTTPRequest(data []byte) (method, uri string, ok bool) {
+	// Simple parser to extract method and URI from HTTP request
+	lines := strings.Split(string(data), "\r\n")
+	if len(lines) == 0 {
+		return "", "", false
+	}
+
+	// Parse the request line
+	parts := strings.Split(lines[0], " ")
+	if len(parts) < 2 {
+		return "", "", false
+	}
+
+	return parts[0], parts[1], true
+}
+
+// shouldDenyRequest checks if a request URI matches any pattern in the deny list
+func (a *Client) shouldDenyRequest(uri string) bool {
+	if len(a.denyList) == 0 {
+		return false
+	}
+
+	for _, pattern := range a.denyList {
+		if strings.HasPrefix(uri, pattern) {
+			klog.V(2).InfoS("Request denied based on deny list", "uri", uri, "pattern", pattern)
+			return true
+		}
+	}
+
+	return false
+}
+
+// logRequestIfNeeded logs API request details if enabled
+func (a *Client) logRequestIfNeeded(data []byte) {
+	if !a.logAPIRequests {
+		return
+	}
+
+	method, uri, ok := parseHTTPRequest(data)
+	if ok {
+		klog.V(2).InfoS("API request", "method", method, "uri", uri)
+		if klog.V(5).Enabled() {
+			klog.V(5).InfoS("API request details", "content", string(data))
+		}
+	}
 }
 
 func newAgentClient(address, agentID, agentIdentifiers string, cs *ClientSet, opts ...grpc.DialOption) (*Client, int, error) {
@@ -166,6 +219,8 @@ func newAgentClient(address, agentID, agentIdentifiers string, cs *ClientSet, op
 		serviceAccountTokenPath: cs.serviceAccountTokenPath,
 		connManager:             newConnectionManager(),
 		warnOnChannelLimit:      cs.warnOnChannelLimit,
+		denyList:                cs.denyList,
+		logAPIRequests:          cs.logAPIRequests,
 	}
 	serverCount, err := a.Connect()
 	if err != nil {
@@ -592,6 +647,31 @@ func (a *Client) proxyToRemote(connID int64, eConn *endpointConn) {
 	}()
 
 	for d := range eConn.dataCh {
+		// Log API request if enabled
+		a.logRequestIfNeeded(d)
+
+		// Check if request should be denied
+		if method, uri, ok := parseHTTPRequest(d); ok && a.shouldDenyRequest(uri) {
+			klog.V(2).InfoS("Denying API request", "method", method, "uri", uri, "connectionID", connID)
+
+			// Send an HTTP 403 Forbidden response
+			forbiddenResp := []byte("HTTP/1.1 403 Forbidden\r\nContent-Length: 9\r\n\r\nForbidden")
+			resp := &client.Packet{
+				Type: client.PacketType_DATA,
+				Payload: &client.Packet_Data{Data: &client.Data{
+					Data:      forbiddenResp,
+					ConnectID: connID,
+				}},
+			}
+
+			if err := a.Send(resp); err != nil {
+				klog.ErrorS(err, "could not send forbidden response", "connectionID", connID)
+			}
+
+			// Skip forwarding this request to the remote
+			continue
+		}
+
 		pos := 0
 		for {
 			n, err := eConn.conn.Write(d[pos:])
