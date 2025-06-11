@@ -57,13 +57,13 @@ type ClientSetConfig struct {
 
 	// LogAPIRequests enables logging of API requests
 	LogAPIRequests bool
-
-	// Kubelet certificate paths for TLS inspection
+	// KubeletCertFile is the file path to the kubelet certificate for TLS inspection
 	KubeletCertFile string
-	KubeletKeyFile  string
+	// KubeletKeyFile is the file path to the kubelet key for TLS inspection
+	KubeletKeyFile string
 }
 
-// ClientSet consists of clients connected to each instance of an HA proxy server.
+// ClientSet maintains a set of agent.Client connections.
 type ClientSet struct {
 	// mu guards access to the clients map
 	mu sync.Mutex
