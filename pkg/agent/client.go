@@ -17,10 +17,14 @@ limitations under the License.
 package agent
 
 import (
+	"bufio"
+	"bytes"
 	"context"
+	"crypto/tls"
 	"fmt"
 	"io"
 	"net"
+	"net/http"
 	"os"
 	runpprof "runtime/pprof"
 	"strconv"
@@ -156,12 +160,138 @@ type Client struct {
 	// API request filtering configuration
 	denyList       []string // List of URI patterns to deny
 	logAPIRequests bool     // Whether to log API requests
+
+	// TLS inspection configuration
+	tlsInspector *TLSInspector // For inspecting TLS traffic
+}
+
+// TLSInspector handles TLS traffic inspection without modifying the original packet
+type TLSInspector struct {
+	certFile   string
+	keyFile    string
+	clientCert *tls.Certificate
+	enabled    bool
+}
+
+// NewTLSInspector creates a new TLS inspector using kubelet certificates
+func NewTLSInspector(certFile, keyFile string) (*TLSInspector, error) {
+	if certFile == "" || keyFile == "" {
+		return &TLSInspector{enabled: false}, nil
+	}
+
+	cert, err := tls.LoadX509KeyPair(certFile, keyFile)
+	if err != nil {
+		return nil, fmt.Errorf("failed to load kubelet certificates: %v", err)
+	}
+
+	return &TLSInspector{
+		certFile:   certFile,
+		keyFile:    keyFile,
+		clientCert: &cert,
+		enabled:    true,
+	}, nil
+}
+
+// TryDecryptAndInspect attempts to decrypt a TLS packet and inspect the HTTP request
+// Returns: shouldDeny, method, uri, error
+func (t *TLSInspector) TryDecryptAndInspect(data []byte) (bool, string, string, error) {
+	if !t.enabled {
+		return false, "", "", nil
+	}
+
+	// Check if this is the beginning of a TLS handshake
+	if !isTLSClientHello(data) {
+		// Not a TLS handshake starting packet, could be application data
+		// or continuation of previous TLS session
+		return false, "", "", nil
+	}
+
+	// Create a memory buffer with the TLS client hello
+	clientHelloBuf := bytes.NewBuffer(data)
+
+	// Setup server side of TLS connection to analyze client hello
+	config := &tls.Config{
+		Certificates: []tls.Certificate{*t.clientCert},
+		ClientAuth:   tls.RequestClientCert,
+	}
+
+	// Create a pipe for our mock connection
+	clientConn, serverConn := net.Pipe()
+
+	// Record what we capture from the TLS session
+	var method, uri string
+	var shouldDeny bool
+	var captureErr error
+
+	// Start a goroutine to handle the server side
+	go func() {
+		defer clientConn.Close()
+
+		// Create TLS server connection
+		tlsConn := tls.Server(serverConn, config)
+
+		// Try to handshake
+		if err := tlsConn.Handshake(); err != nil {
+			captureErr = fmt.Errorf("TLS handshake error: %v", err)
+			return
+		}
+
+		// Read the first HTTP request
+		bufReader := bufio.NewReader(tlsConn)
+		req, err := http.ReadRequest(bufReader)
+		if err != nil {
+			captureErr = fmt.Errorf("failed to read HTTP request: %v", err)
+			return
+		}
+
+		// Capture the request details
+		method = req.Method
+		uri = req.URL.Path
+	}()
+
+	// Send the client hello to our mock server connection
+	if _, err := io.Copy(clientConn, clientHelloBuf); err != nil {
+		return false, "", "", fmt.Errorf("error sending client hello: %v", err)
+	}
+
+	// Close our connection to signal end of data
+	serverConn.Close()
+
+	// Check if we successfully captured the request
+	if captureErr != nil {
+		// This is expected for many cases - we're trying to catch just the initial request
+		return false, "", "", nil
+	}
+
+	return shouldDeny, method, uri, nil
+}
+
+// isTLSClientHello checks if the packet appears to be a TLS Client Hello
+func isTLSClientHello(data []byte) bool {
+	// TLS handshakes typically start with byte 0x16 (22 decimal) for handshake
+	// followed by 0x03 0x01 or higher for TLS version
+	// and the handshake type for Client Hello is 0x01
+	return len(data) >= 6 &&
+		data[0] == 0x16 && // handshake
+		data[1] >= 0x03 && // TLS version major
+		data[5] == 0x01 // Client Hello
+}
+
+func isTLSHandshake(data []byte) bool {
+	// TLS handshakes typically start with byte 0x16 (22 decimal)
+	return len(data) >= 3 && data[0] == 0x16 && data[1] >= 0x03
 }
 
 // parseHTTPRequest attempts to parse data as an HTTP request
 func parseHTTPRequest(data []byte) (method, uri string, ok bool) {
-	// Simple parser to extract method and URI from HTTP request
-	lines := strings.Split(string(data), "\r\n")
+	// Check if this appears to be TLS data
+	if isTLSHandshake(data) {
+		return "TLS", "handshake", true
+	}
+
+	// Try to parse as plaintext HTTP
+	str := string(data)
+	lines := strings.Split(str, "\r\n")
 	if len(lines) == 0 {
 		return "", "", false
 	}
@@ -169,15 +299,59 @@ func parseHTTPRequest(data []byte) (method, uri string, ok bool) {
 	// Parse the request line
 	parts := strings.Split(lines[0], " ")
 	if len(parts) < 2 {
+		// Try to extract something meaningful for non-HTTP protocol data
+		if len(str) > 0 {
+			// For non-HTTP protocol data, just return a generic identifier
+			// and the first few bytes as hex for identification
+			maxLen := 20
+			if len(str) < maxLen {
+				maxLen = len(str)
+			}
+			return "BINARY", fmt.Sprintf("protocol-data[%x...]", str[:maxLen]), true
+		}
 		return "", "", false
 	}
 
+	// This is a proper HTTP request
 	return parts[0], parts[1], true
+}
+
+// extractHTTPHeaders parses out the headers from an HTTP request
+func extractHTTPHeaders(data []byte) map[string]string {
+	headers := make(map[string]string)
+
+	str := string(data)
+	lines := strings.Split(str, "\r\n")
+
+	// Skip first line (request line) and parse headers
+	for i := 1; i < len(lines); i++ {
+		line := lines[i]
+		if line == "" {
+			break // End of headers
+		}
+
+		parts := strings.SplitN(line, ":", 2)
+		if len(parts) == 2 {
+			headers[strings.TrimSpace(parts[0])] = strings.TrimSpace(parts[1])
+		}
+	}
+
+	return headers
 }
 
 // shouldDenyRequest checks if a request URI matches any pattern in the deny list
 func (a *Client) shouldDenyRequest(uri string) bool {
+	// Currently we can only filter unencrypted HTTP traffic
+	// TLS traffic cannot be inspected without a TLS intercepting proxy
+
 	if len(a.denyList) == 0 {
+		return false
+	}
+
+	// Don't try to filter TLS handshakes or binary data
+	if uri == "handshake" || strings.HasPrefix(uri, "protocol-data") {
+		// We cannot filter TLS content without implementing TLS interception
+		klog.V(4).InfoS("Cannot filter TLS/encrypted traffic", "uri", uri)
 		return false
 	}
 
@@ -199,14 +373,41 @@ func (a *Client) logRequestIfNeeded(data []byte) {
 
 	method, uri, ok := parseHTTPRequest(data)
 	if ok {
+		if method == "TLS" {
+			klog.V(2).InfoS("TLS traffic detected (encrypted)", "type", uri)
+			if klog.V(4).Enabled() {
+				klog.V(4).InfoS("Note: TLS traffic cannot be inspected without TLS interception")
+			}
+			return
+		}
+
+		if method == "BINARY" {
+			klog.V(2).InfoS("Binary protocol data", "preview", uri)
+			return
+		}
+
+		// For regular HTTP requests
 		klog.V(2).InfoS("API request", "method", method, "uri", uri)
+
+		// Only log full request details at higher verbosity
 		if klog.V(5).Enabled() {
-			klog.V(5).InfoS("API request details", "content", string(data))
+			// Extract headers for better debugging
+			headers := extractHTTPHeaders(data)
+			klog.V(5).InfoS("API request details",
+				"method", method,
+				"uri", uri,
+				"headers", headers,
+				"size", len(data))
 		}
 	}
 }
 
 func newAgentClient(address, agentID, agentIdentifiers string, cs *ClientSet, opts ...grpc.DialOption) (*Client, int, error) {
+	tlsInspector, err := NewTLSInspector(cs.kubeletCertFile, cs.kubeletKeyFile)
+	if err != nil {
+		return nil, 0, fmt.Errorf("failed to initialize TLS inspector: %v", err)
+	}
+
 	a := &Client{
 		cs:                      cs,
 		address:                 address,
@@ -221,6 +422,7 @@ func newAgentClient(address, agentID, agentIdentifiers string, cs *ClientSet, op
 		warnOnChannelLimit:      cs.warnOnChannelLimit,
 		denyList:                cs.denyList,
 		logAPIRequests:          cs.logAPIRequests,
+		tlsInspector:            tlsInspector,
 	}
 	serverCount, err := a.Connect()
 	if err != nil {
@@ -646,32 +848,68 @@ func (a *Client) proxyToRemote(connID int64, eConn *endpointConn) {
 		}
 	}()
 
+	// Track connections to determine if they've been examined for TLS content
+	connectionInspected := false
+
 	for d := range eConn.dataCh {
-		// Log API request if enabled
-		a.logRequestIfNeeded(d)
+		// Handle the initial packet which might be a TLS handshake
+		if !connectionInspected && len(d) > 0 && isTLSHandshake(d) {
+			// This might be the start of a TLS session, try to inspect
+			shouldDeny, method, uri, err := a.tlsInspector.TryDecryptAndInspect(d)
+			connectionInspected = true
 
-		// Check if request should be denied
-		if method, uri, ok := parseHTTPRequest(d); ok && a.shouldDenyRequest(uri) {
-			klog.V(2).InfoS("Denying API request", "method", method, "uri", uri, "connectionID", connID)
-
-			// Send an HTTP 403 Forbidden response
-			forbiddenResp := []byte("HTTP/1.1 403 Forbidden\r\nContent-Length: 9\r\n\r\nForbidden")
-			resp := &client.Packet{
-				Type: client.PacketType_DATA,
-				Payload: &client.Packet_Data{Data: &client.Data{
-					Data:      forbiddenResp,
-					ConnectID: connID,
-				}},
+			if err != nil {
+				// Log error but continue (we'll pass the traffic through)
+				klog.V(4).InfoS("Failed to inspect TLS traffic", "error", err, "connectionID", connID)
 			}
 
-			if err := a.Send(resp); err != nil {
-				klog.ErrorS(err, "could not send forbidden response", "connectionID", connID)
+			// Log the request if we could decrypt it and logging is enabled
+			if a.logAPIRequests && method != "" && uri != "" {
+				klog.V(2).InfoS("TLS API request", "method", method, "uri", uri, "connectionID", connID)
 			}
 
-			// Skip forwarding this request to the remote
-			continue
+			// Check if this request should be denied
+			if shouldDeny {
+				klog.V(2).InfoS("Denying TLS API request", "method", method, "uri", uri, "connectionID", connID)
+
+				// Close the connection to deny the request
+				eConn.cleanup()
+				return
+			}
+		} else if !connectionInspected {
+			// Not a TLS connection or couldn't inspect
+			connectionInspected = true
 		}
 
+		// For plaintext HTTP, continue with the existing logic
+		if !isTLSHandshake(d) {
+			// Log API request if enabled
+			a.logRequestIfNeeded(d)
+
+			// Check if request should be denied
+			if method, uri, ok := parseHTTPRequest(d); ok && a.shouldDenyRequest(uri) {
+				klog.V(2).InfoS("Denying API request", "method", method, "uri", uri, "connectionID", connID)
+
+				// Send an HTTP 403 Forbidden response
+				forbiddenResp := []byte("HTTP/1.1 403 Forbidden\r\nContent-Length: 9\r\n\r\nForbidden")
+				resp := &client.Packet{
+					Type: client.PacketType_DATA,
+					Payload: &client.Packet_Data{Data: &client.Data{
+						Data:      forbiddenResp,
+						ConnectID: connID,
+					}},
+				}
+
+				if err := a.Send(resp); err != nil {
+					klog.ErrorS(err, "could not send forbidden response", "connectionID", connID)
+				}
+
+				// Skip forwarding this request to the remote
+				continue
+			}
+		}
+
+		// Forward the original packet unchanged
 		pos := 0
 		for {
 			n, err := eConn.conn.Write(d[pos:])

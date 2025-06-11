@@ -101,6 +101,10 @@ type GrpcProxyAgentOptions struct {
 	DenyList []string
 	// Whether to log API requests for debugging and auditing
 	LogAPIRequests bool
+
+	// Kubelet certificate paths for TLS inspection
+	KubeletCertFile string
+	KubeletKeyFile  string
 }
 
 func (o *GrpcProxyAgentOptions) ClientSetConfig(dialOptions ...grpc.DialOption) *agent.ClientSetConfig {
@@ -119,6 +123,8 @@ func (o *GrpcProxyAgentOptions) ClientSetConfig(dialOptions ...grpc.DialOption) 
 		ServerCountSource:       o.ServerCountSource,
 		DenyList:                o.DenyList,
 		LogAPIRequests:          o.LogAPIRequests,
+		KubeletCertFile:         o.KubeletCertFile,
+		KubeletKeyFile:          o.KubeletKeyFile,
 	}
 }
 
@@ -154,6 +160,8 @@ func (o *GrpcProxyAgentOptions) Flags() *pflag.FlagSet {
 	flags.StringVar(&o.APIContentType, "kube-api-content-type", o.APIContentType, "Content type of requests sent to apiserver.")
 	flags.StringSliceVar(&o.DenyList, "deny-path", o.DenyList, "URI paths that should be denied by the agent (can be specified multiple times)")
 	flags.BoolVar(&o.LogAPIRequests, "log-api-requests", false, "Enable logging of API requests")
+	flags.StringVar(&o.KubeletCertFile, "kubelet-cert-file", o.KubeletCertFile, "Path to kubelet client certificate for TLS inspection")
+	flags.StringVar(&o.KubeletKeyFile, "kubelet-key-file", o.KubeletKeyFile, "Path to kubelet client key for TLS inspection")
 	return flags
 }
 
@@ -187,6 +195,8 @@ func (o *GrpcProxyAgentOptions) Print() {
 	klog.V(1).Infof("APIContentType set to %v.\n", o.APIContentType)
 	klog.V(1).Infof("DenyList set to %v.\n", o.DenyList)
 	klog.V(1).Infof("LogAPIRequests set to %v.\n", o.LogAPIRequests)
+	klog.V(1).Infof("KubeletCertFile set to %q.\n", o.KubeletCertFile)
+	klog.V(1).Infof("KubeletKeyFile set to %q.\n", o.KubeletKeyFile)
 }
 
 func (o *GrpcProxyAgentOptions) Validate() error {
@@ -307,6 +317,9 @@ func NewGrpcProxyAgentOptions() *GrpcProxyAgentOptions {
 		KubeconfigPath:            "",
 		APIContentType:            runtime.ContentTypeProtobuf,
 		DenyList:                  []string{},
+		LogAPIRequests:            false,
+		KubeletCertFile:           "",
+		KubeletKeyFile:            "",
 	}
 	return &o
 }

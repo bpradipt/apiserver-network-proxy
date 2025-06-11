@@ -52,11 +52,15 @@ type ClientSetConfig struct {
 	ServerLeaseCounter      ServerCounter
 	ServerCountSource       string
 
-	// DenyList is a list of URI paths that should be denied by the agent
+	// DenyList is a list of URI patterns that should be denied by the agent
 	DenyList []string
 
 	// LogAPIRequests enables logging of API requests
 	LogAPIRequests bool
+
+	// Kubelet certificate paths for TLS inspection
+	KubeletCertFile string
+	KubeletKeyFile  string
 }
 
 // ClientSet consists of clients connected to each instance of an HA proxy server.
@@ -127,6 +131,10 @@ type ClientSet struct {
 	// API request filtering configuration
 	denyList       []string
 	logAPIRequests bool
+
+	// Kubelet certificate paths for TLS inspection
+	kubeletCertFile string
+	kubeletKeyFile  string
 }
 
 func (cs *ClientSet) ClientsCount() int {
@@ -210,6 +218,8 @@ func (cc *ClientSetConfig) NewAgentClientSet(drainCh, stopCh <-chan struct{}) *C
 		serverCountSource:       cc.ServerCountSource,
 		denyList:                cc.DenyList,
 		logAPIRequests:          cc.LogAPIRequests,
+		kubeletCertFile:         cc.KubeletCertFile,
+		kubeletKeyFile:          cc.KubeletKeyFile,
 	}
 }
 
